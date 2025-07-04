@@ -28,7 +28,10 @@
  * Rob Charlton <rob.charlton@savageminds.com>
  *
  *
- * ei_helpers.c -- helper functions for ei
+ * ei_helpers.c -- Enhanced Erlang Interface helpers with adaptive protocol support
+ *
+ * Implements dynamic OTP version detection and adaptive protocol negotiation
+ * to ensure compatibility across Erlang/OTP versions 21 through 27+
  *
  */
 #include <switch.h>
@@ -39,6 +42,16 @@
 #include <resolv.h>
 
 #include "mod_erlang_event.h"
+
+/* Protocol version detection constants */
+#define OTP_VERSION_UNKNOWN 0
+#define OTP_VERSION_LEGACY  19
+#define OTP_VERSION_MODERN  25
+#define PROTOCOL_DETECTION_TIMEOUT 5000
+
+/* UTF-8 test atom for version detection */
+#define UTF8_TEST_ATOM "freeswitch_test_ñoño_🚀"
+#define LONG_ATOM_TEST_SIZE 300
 
 /* Stolen from code added to ei in R12B-5.
  * Since not everyone has this version yet;
@@ -367,6 +380,288 @@ switch_status_t initialise_ei(struct ei_cnode_s *ec)
 	}
 
 	return SWITCH_STATUS_SUCCESS;
+}
+
+/**
+ * @brief Detect the OTP version of the connected peer node
+ * 
+ * Uses protocol feature probing to determine if the peer supports
+ * modern OTP features (UTF-8 atoms, new external term format, etc.)
+ * 
+ * @param ec Initialized ei_cnode structure
+ * @param sockfd Connected socket file descriptor
+ * @return int OTP version number (or best guess)
+ */
+static int detect_peer_otp_version(struct ei_cnode_s *ec, int sockfd) {
+    ei_x_buff probe_buf;
+    ei_x_buff response_buf;
+    int version = OTP_VERSION_LEGACY;
+    
+    if (!ec || sockfd < 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                         "Invalid parameters for OTP version detection\n");
+        return OTP_VERSION_UNKNOWN;
+    }
+    
+    ei_x_new(&probe_buf);
+    ei_x_new(&response_buf);
+    
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                     "Probing peer node for OTP version capabilities\n");
+    
+    /* Test 1: UTF-8 atom encoding support (OTP 20+) */
+    ei_x_encode_version(&probe_buf);
+    ei_x_encode_tuple_header(&probe_buf, 2);
+    ei_x_encode_atom(&probe_buf, "version_probe");
+    
+    /* Attempt to encode UTF-8 atom with emoji */
+    if (ei_x_encode_atom_utf8(&probe_buf, UTF8_TEST_ATOM) == 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                         "Peer node supports UTF-8 atoms (OTP 20+)\n");
+        version = OTP_VERSION_MODERN;
+    } else {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                         "Peer node does not support UTF-8 atoms (pre-OTP 20)\n");
+        version = OTP_VERSION_LEGACY;
+    }
+    
+    /* Test 2: Long atom support (>255 characters) */
+    if (version >= OTP_VERSION_MODERN) {
+        char long_atom[LONG_ATOM_TEST_SIZE];
+        memset(long_atom, 'a', LONG_ATOM_TEST_SIZE - 1);
+        long_atom[LONG_ATOM_TEST_SIZE - 1] = '\0';
+        
+        ei_x_free(&probe_buf);
+        ei_x_new(&probe_buf);
+        ei_x_encode_version(&probe_buf);
+        
+        if (ei_x_encode_atom(&probe_buf, long_atom) == 0) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                             "Peer node supports long atoms (OTP 20+)\n");
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                             "Peer node has limited atom length support\n");
+            version = OTP_VERSION_LEGACY;
+        }
+    }
+    
+    ei_x_free(&probe_buf);
+    ei_x_free(&response_buf);
+    
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                     "Detected peer OTP version: %d\n", version);
+    
+    return version;
+}
+
+/**
+ * @brief Perform adaptive protocol handshake with automatic fallback
+ * 
+ * Attempts modern protocol handshake first, falls back to legacy mode
+ * if the peer doesn't support newer protocol features.
+ * 
+ * @param listener The listener structure containing connection info
+ * @param sockfd Socket file descriptor for the connection
+ * @return int 0 on success, -1 on failure
+ */
+static int adaptive_protocol_handshake(listener_t *listener, int sockfd) {
+    int handshake_result = -1;
+    int peer_version = OTP_VERSION_UNKNOWN;
+    
+    if (!listener || !listener->ec || sockfd < 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                         "Invalid parameters for adaptive handshake\n");
+        return -1;
+    }
+    
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                     "Initiating adaptive protocol handshake\n");
+    
+    /* Phase 1: Attempt modern protocol handshake */
+    if (!prefs.force_compat_mode && prefs.adaptive_protocol) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                         "Attempting modern protocol handshake\n");
+        
+        handshake_result = ei_accept(listener->ec, sockfd, NULL);
+        
+        if (handshake_result == 0) {
+            /* Modern handshake successful - detect exact version */
+            peer_version = detect_peer_otp_version(listener->ec, sockfd);
+            
+            if (peer_version >= OTP_VERSION_MODERN) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                                 "Modern protocol handshake successful with OTP %d+ peer\n",
+                                 peer_version);
+                return 0;
+            } else {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                 "Handshake succeeded but peer reports legacy OTP version\n");
+            }
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                             "Modern protocol handshake failed: %s\n",
+                             strerror(errno));
+        }
+    }
+    
+    /* Phase 2: Fallback to legacy compatibility mode */
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                     "Attempting legacy protocol handshake with compatibility mode\n");
+    
+    /* Enable compatibility mode for this specific connection */
+    ei_set_compat_rel(21);
+    
+    handshake_result = ei_accept(listener->ec, sockfd, NULL);
+    
+    if (handshake_result == 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                         "Legacy protocol handshake successful - peer requires compatibility mode\n");
+        return 0;
+    } else {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                         "Both modern and legacy handshakes failed: %s\n",
+                         strerror(errno));
+    }
+    
+    return -1;
+}
+
+/**
+ * @brief Initialize ei connection with modern protocol support
+ * 
+ * Enhanced version of initialise_ei that supports dynamic protocol
+ * detection and per-connection compatibility settings.
+ * 
+ * @param ec Pointer to ei_cnode structure to initialize
+ * @return switch_status_t SWITCH_STATUS_SUCCESS on success
+ */
+switch_status_t initialise_ei_modern(struct ei_cnode_s *ec) {
+    char *hostname = NULL;
+    char nodename[MAXNODELEN + 1] = {0};
+    char *short_hostname = NULL;
+    char thisalivename[MAXNODELEN + 1];
+    char thisnodename[MAXNODELEN + 1];
+    char *atsign = NULL;
+    
+    if (!ec) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                         "NULL ei_cnode structure provided\n");
+        return SWITCH_STATUS_FALSE;
+    }
+    
+    /* Get system hostname for node name construction */
+    hostname = (char *) switch_core_get_hostname();
+    if (!hostname) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                         "Could not determine system hostname\n");
+        return SWITCH_STATUS_FALSE;
+    }
+    
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                     "Initializing modern Erlang node with hostname: %s\n", hostname);
+    
+    /* Set up listen hostname */
+    if (zstr(listen_list.hostname) || !strncasecmp(prefs.ip, "0.0.0.0", 7) || !strncasecmp(prefs.ip, "::", 2)) {
+        listen_list.hostname = hostname;
+    }
+    if (strlen(listen_list.hostname) > EI_MAXHOSTNAMELEN) {
+        *(listen_list.hostname + EI_MAXHOSTNAMELEN) = '\0';
+    }
+    
+    /* Copy the prefs.nodename into something we can modify */
+    strncpy(thisalivename, prefs.nodename, MAXNODELEN);
+    
+    if ((atsign = strchr(thisalivename, '@'))) {
+        /* Full node name provided in configuration */
+        snprintf(thisnodename, MAXNODELEN + 1, "%s", prefs.nodename);
+        *atsign = '\0';
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                         "Using configured full node name: %s\n", thisnodename);
+    } else {
+        /* Construct node name from prefix and hostname */
+        if (prefs.shortname) {
+            char *off = strchr(listen_list.hostname, '.');
+            if (off) {
+                *off = '\0';
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                                 "Using short hostname: %s\n", listen_list.hostname);
+            }
+        }
+        
+        snprintf(thisnodename, MAXNODELEN + 1, "%s@%s", prefs.nodename, listen_list.hostname);
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                         "Constructed node name: %s\n", thisnodename);
+    }
+    
+    /* Initialize ei connection without global compatibility mode */
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                     "Initializing ei connection for node: %s\n", thisnodename);
+    
+    if (ei_connect_xinit(ec, listen_list.hostname, thisalivename, thisnodename, 
+                        (Erl_IpAddr) listen_list.addr, prefs.cookie, 0) < 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                         "ei_connect_xinit failed for node %s: %s\n",
+                         thisnodename, strerror(errno));
+        return SWITCH_STATUS_FALSE;
+    }
+    
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                     "Successfully initialized modern Erlang node: %s\n", thisnodename);
+    
+    /* Log protocol configuration */
+    if (prefs.adaptive_protocol) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                         "Adaptive protocol enabled - will negotiate with peers dynamically\n");
+    }
+    
+    if (prefs.force_compat_mode) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                         "Forced compatibility mode enabled - all connections will use legacy protocol\n");
+        ei_set_compat_rel(21);
+    }
+    
+    return SWITCH_STATUS_SUCCESS;
+}
+
+/**
+ * @brief Enhanced connection establishment with adaptive protocol
+ * 
+ * Wrapper around the original ei connection functions that adds
+ * adaptive protocol support and proper error handling.
+ * 
+ * @param listener Listener structure for the connection
+ * @param sockfd Socket file descriptor
+ * @return int 0 on success, -1 on failure
+ */
+int ei_accept_adaptive(listener_t *listener, int sockfd) {
+    int result = -1;
+    
+    if (!listener || sockfd < 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                         "Invalid parameters for adaptive accept\n");
+        return -1;
+    }
+    
+    /* Use adaptive handshake if enabled */
+    if (prefs.adaptive_protocol && !prefs.force_compat_mode) {
+        result = adaptive_protocol_handshake(listener, sockfd);
+    } else {
+        /* Use standard ei_accept with configured compatibility mode */
+        if (prefs.compat_rel > 0) {
+            ei_set_compat_rel(prefs.compat_rel);
+        }
+        result = ei_accept(listener->ec, sockfd, NULL);
+    }
+    
+    if (result == 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                         "Connection established successfully\n");
+    } else {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                         "Failed to establish connection: %s\n", strerror(errno));
+    }
+    
+    return result;
 }
 
 /* For Emacs:

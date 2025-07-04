@@ -200,6 +200,12 @@ struct bindings_struct {
 typedef struct bindings_struct bindings_t;
 
 #define MAX_ACL 100
+/* Protocol version constants */
+#define OTP_MIN_SUPPORTED_VERSION 21
+#define OTP_MODERN_VERSION_THRESHOLD 25
+#define PROTOCOL_DETECTION_TIMEOUT_MS 5000
+
+/* Enhanced preferences structure with adaptive protocol support */
 struct prefs_struct {
 	switch_mutex_t *mutex;
 	char *ip;
@@ -213,10 +219,16 @@ struct prefs_struct {
 	uint32_t acl_count;
 	uint32_t id;
 	erlang_encoding_t encoding;
-	int compat_rel;
+	int compat_rel;                    /* Legacy compatibility release */
 	int max_event_bulk;
 	int max_log_bulk;
 	int stop_on_bind_error;
+	
+	/* New adaptive protocol fields */
+	switch_bool_t adaptive_protocol;   /* Enable adaptive protocol negotiation */
+	switch_bool_t force_compat_mode;   /* Force legacy compatibility mode */
+	int protocol_timeout;              /* Timeout for protocol detection */
+	switch_bool_t debug_protocol;      /* Enable protocol debugging */
 };
 typedef struct prefs_struct prefs_t;
 
@@ -251,6 +263,10 @@ void ei_hash_ref(erlang_ref * ref, char *output);
 int ei_compare_pids(erlang_pid * pid1, erlang_pid * pid2);
 int ei_decode_string_or_binary(char *buf, int *index, int maxlen, char *dst);
 switch_status_t initialise_ei(struct ei_cnode_s *ec);
+
+/* Enhanced adaptive protocol functions */
+switch_status_t initialise_ei_modern(struct ei_cnode_s *ec);
+int ei_accept_adaptive(listener_t *listener, int sockfd);
 #define ei_encode_switch_event(_b, _e) ei_encode_switch_event_tag(_b, _e, "event")
 
 /* crazy macro for toggling encoding type */

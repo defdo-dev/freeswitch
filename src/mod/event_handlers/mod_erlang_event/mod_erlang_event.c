@@ -1227,6 +1227,12 @@ static int config(void)
 	prefs.compat_rel = 0;
 	prefs.max_event_bulk = 1;
 	prefs.max_log_bulk = 1;
+	
+	/* Initialize new adaptive protocol defaults */
+	prefs.adaptive_protocol = SWITCH_TRUE;   /* Enable by default */
+	prefs.force_compat_mode = SWITCH_FALSE;  /* Disable by default */
+	prefs.protocol_timeout = PROTOCOL_DETECTION_TIMEOUT_MS;
+	prefs.debug_protocol = SWITCH_FALSE;
 
 
 	if (!(xml = switch_xml_open_cfg(cf, &cfg, NULL))) {
@@ -1276,10 +1282,47 @@ static int config(void)
 					prefs.max_log_bulk = atoi(val);
 				} else if (!strcasecmp(var, "stop-on-bind-error")) {
 					prefs.stop_on_bind_error = switch_true(val) ? 1 : 0;
+				} else if (!strcasecmp(var, "adaptive-protocol")) {
+					prefs.adaptive_protocol = switch_true(val);
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+									 "Adaptive protocol: %s\n", 
+									 prefs.adaptive_protocol ? "enabled" : "disabled");
+				} else if (!strcasecmp(var, "force-compat-mode")) {
+					prefs.force_compat_mode = switch_true(val);
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+									 "Force compatibility mode: %s\n",
+									 prefs.force_compat_mode ? "enabled" : "disabled");
+				} else if (!strcasecmp(var, "protocol-timeout")) {
+					prefs.protocol_timeout = atoi(val);
+					if (prefs.protocol_timeout < 1000) {
+						prefs.protocol_timeout = 1000;  /* Minimum 1 second */
+					}
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+									 "Protocol detection timeout: %d ms\n",
+									 prefs.protocol_timeout);
+				} else if (!strcasecmp(var, "debug-protocol")) {
+					prefs.debug_protocol = switch_true(val);
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+									 "Protocol debugging: %s\n",
+									 prefs.debug_protocol ? "enabled" : "disabled");
 				}
 			}
 		}
 		switch_xml_free(xml);
+	}
+	
+	/* Validate configuration */
+	if (prefs.force_compat_mode && prefs.adaptive_protocol) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						 "force-compat-mode overrides adaptive-protocol setting\n");
+	}
+	
+	if (prefs.compat_rel > 0 && prefs.adaptive_protocol) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						 "compat-rel parameter conflicts with adaptive-protocol\n");
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						 "Adaptive protocol will be disabled\n");
+		prefs.adaptive_protocol = SWITCH_FALSE;
 	}
 
 	if (zstr(prefs.ip)) {
@@ -2069,8 +2112,9 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_erlang_event_runtime)
 		ei_set_compat_rel(prefs.compat_rel);
 	}
 
-	if (SWITCH_STATUS_SUCCESS != initialise_ei(&ec)) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to init ei connection\n");
+	/* Initialize Erlang interface with modern support */
+	if (SWITCH_STATUS_SUCCESS != initialise_ei_modern(&ec)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to init modern ei connection\n");
 		goto end;
 	}
 
