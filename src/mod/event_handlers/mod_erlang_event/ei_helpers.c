@@ -40,6 +40,7 @@
 #include <netinet/in.h>
 #include <arpa/nameser.h>
 #include <resolv.h>
+#include <time.h>
 
 #include "mod_erlang_event.h"
 
@@ -52,6 +53,31 @@
 /* UTF-8 test atom for version detection */
 #define UTF8_TEST_ATOM "freeswitch_test_ñoño_🚀"
 #define LONG_ATOM_TEST_SIZE 300
+
+/* Compatibility layer for ei functions across different OTP versions */
+#ifdef __GNUC__
+/* Use weak symbol linking to detect function availability at runtime */
+extern int ei_x_encode_atom_utf8(ei_x_buff *x, const char *p) __attribute__((weak));
+#define HAS_EI_X_ENCODE_ATOM_UTF8() (ei_x_encode_atom_utf8 != NULL)
+#else
+/* For non-GCC compilers, assume function is not available */
+#define HAS_EI_X_ENCODE_ATOM_UTF8() (0)
+#endif
+
+/* Safe UTF-8 atom encoding with automatic fallback */
+static int ei_x_encode_atom_utf8_safe(ei_x_buff *x, const char *p) {
+#ifdef __GNUC__
+    if (HAS_EI_X_ENCODE_ATOM_UTF8()) {
+        return ei_x_encode_atom_utf8(x, p);
+    } else {
+        /* Fallback to regular atom encoding for older ei versions */
+        return ei_x_encode_atom(x, p);
+    }
+#else
+    /* Always use regular atom encoding for non-GCC builds */
+    return ei_x_encode_atom(x, p);
+#endif
+}
 
 /* Stolen from code added to ei in R12B-5.
  * Since not everyone has this version yet;
@@ -383,82 +409,41 @@ switch_status_t initialise_ei(struct ei_cnode_s *ec)
 }
 
 /**
- * @brief Detect the OTP version of the connected peer node
+ * @brief Detect the OTP version capabilities of the local ei library
  * 
- * Uses protocol feature probing to determine if the peer supports
- * modern OTP features (UTF-8 atoms, new external term format, etc.)
+ * Determines what protocol features are available in the locally installed
+ * ei library. This is more reliable than trying to detect peer capabilities.
  * 
- * @param ec Initialized ei_cnode structure
- * @param sockfd Connected socket file descriptor
- * @return int OTP version number (or best guess)
+ * @return int OTP version number representing local capabilities
  */
-static int detect_peer_otp_version(struct ei_cnode_s *ec, int sockfd) {
-    ei_x_buff probe_buf;
-    ei_x_buff response_buf;
-    int version = OTP_VERSION_LEGACY;
-    
-    if (!ec || sockfd < 0) {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                         "Invalid parameters for OTP version detection\n");
-        return OTP_VERSION_UNKNOWN;
-    }
-    
-    ei_x_new(&probe_buf);
-    ei_x_new(&response_buf);
+static int detect_local_ei_capabilities(void) {
+    int capabilities = OTP_VERSION_LEGACY; /* Start with legacy baseline */
     
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-                     "Probing peer node for OTP version capabilities\n");
+                     "Detecting local ei library capabilities\n");
     
-    /* Test 1: UTF-8 atom encoding support (OTP 20+) */
-    ei_x_encode_version(&probe_buf);
-    ei_x_encode_tuple_header(&probe_buf, 2);
-    ei_x_encode_atom(&probe_buf, "version_probe");
-    
-    /* Attempt to encode UTF-8 atom with emoji */
-    if (ei_x_encode_atom_utf8(&probe_buf, UTF8_TEST_ATOM) == 0) {
+    /* Check if UTF-8 atom encoding is available */
+    if (HAS_EI_X_ENCODE_ATOM_UTF8()) {
+        capabilities = OTP_VERSION_MODERN;
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-                         "Peer node supports UTF-8 atoms (OTP 20+)\n");
-        version = OTP_VERSION_MODERN;
+                         "UTF-8 atom encoding available - modern ei library detected\n");
     } else {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-                         "Peer node does not support UTF-8 atoms (pre-OTP 20)\n");
-        version = OTP_VERSION_LEGACY;
+                         "UTF-8 atom encoding not available - legacy ei library detected\n");
     }
-    
-    /* Test 2: Long atom support (>255 characters) */
-    if (version >= OTP_VERSION_MODERN) {
-        char long_atom[LONG_ATOM_TEST_SIZE];
-        memset(long_atom, 'a', LONG_ATOM_TEST_SIZE - 1);
-        long_atom[LONG_ATOM_TEST_SIZE - 1] = '\0';
-        
-        ei_x_free(&probe_buf);
-        ei_x_new(&probe_buf);
-        ei_x_encode_version(&probe_buf);
-        
-        if (ei_x_encode_atom(&probe_buf, long_atom) == 0) {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-                             "Peer node supports long atoms (OTP 20+)\n");
-        } else {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                             "Peer node has limited atom length support\n");
-            version = OTP_VERSION_LEGACY;
-        }
-    }
-    
-    ei_x_free(&probe_buf);
-    ei_x_free(&response_buf);
     
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-                     "Detected peer OTP version: %d\n", version);
+                     "Local ei library capabilities: OTP %d equivalent\n", capabilities);
     
-    return version;
+    return capabilities;
 }
 
 /**
  * @brief Perform adaptive protocol handshake with automatic fallback
  * 
- * Attempts modern protocol handshake first, falls back to legacy mode
- * if the peer doesn't support newer protocol features.
+ * Uses local ei library capabilities to determine the best protocol approach.
+ * Attempts modern protocol first if local library supports it, otherwise
+ * falls back to legacy compatibility mode.
  * 
  * @param listener The listener structure containing connection info
  * @param sockfd Socket file descriptor for the connection
@@ -466,7 +451,7 @@ static int detect_peer_otp_version(struct ei_cnode_s *ec, int sockfd) {
  */
 static int adaptive_protocol_handshake(listener_t *listener, int sockfd) {
     int handshake_result = -1;
-    int peer_version = OTP_VERSION_UNKNOWN;
+    int local_capabilities = OTP_VERSION_UNKNOWN;
     
     if (!listener || !listener->ec || sockfd < 0) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
@@ -477,26 +462,22 @@ static int adaptive_protocol_handshake(listener_t *listener, int sockfd) {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
                      "Initiating adaptive protocol handshake\n");
     
-    /* Phase 1: Attempt modern protocol handshake */
-    if (!prefs.force_compat_mode && prefs.adaptive_protocol) {
+    /* Determine local ei library capabilities */
+    local_capabilities = detect_local_ei_capabilities();
+    
+    /* Phase 1: Attempt modern protocol if we have the capabilities */
+    if (!prefs.force_compat_mode && prefs.adaptive_protocol && 
+        local_capabilities >= OTP_VERSION_MODERN) {
+        
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-                         "Attempting modern protocol handshake\n");
+                         "Attempting modern protocol handshake (local ei supports it)\n");
         
         handshake_result = ei_accept(listener->ec, sockfd, NULL);
         
         if (handshake_result == 0) {
-            /* Modern handshake successful - detect exact version */
-            peer_version = detect_peer_otp_version(listener->ec, sockfd);
-            
-            if (peer_version >= OTP_VERSION_MODERN) {
-                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-                                 "Modern protocol handshake successful with OTP %d+ peer\n",
-                                 peer_version);
-                return 0;
-            } else {
-                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                                 "Handshake succeeded but peer reports legacy OTP version\n");
-            }
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                             "Modern protocol handshake successful\n");
+            return 0;
         } else {
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
                              "Modern protocol handshake failed: %s\n",
@@ -514,8 +495,8 @@ static int adaptive_protocol_handshake(listener_t *listener, int sockfd) {
     handshake_result = ei_accept(listener->ec, sockfd, NULL);
     
     if (handshake_result == 0) {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                         "Legacy protocol handshake successful - peer requires compatibility mode\n");
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                         "Legacy protocol handshake successful\n");
         return 0;
     } else {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
@@ -608,16 +589,22 @@ switch_status_t initialise_ei_modern(struct ei_cnode_s *ec) {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
                      "Successfully initialized modern Erlang node: %s\n", thisnodename);
     
-    /* Log protocol configuration */
+    /* Log protocol configuration and capabilities */
+    int local_capabilities = detect_local_ei_capabilities();
+    
     if (prefs.adaptive_protocol) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-                         "Adaptive protocol enabled - will negotiate with peers dynamically\n");
+                         "Adaptive protocol enabled - will negotiate based on local capabilities (OTP %d)\n",
+                         local_capabilities);
     }
     
     if (prefs.force_compat_mode) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
                          "Forced compatibility mode enabled - all connections will use legacy protocol\n");
         ei_set_compat_rel(21);
+    } else if (local_capabilities < OTP_VERSION_MODERN) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                         "Local ei library has limited capabilities - will use legacy protocol by default\n");
     }
     
     return SWITCH_STATUS_SUCCESS;
