@@ -55,28 +55,37 @@
 #define LONG_ATOM_TEST_SIZE 300
 
 /* Compatibility layer for ei functions across different OTP versions */
-#ifdef __GNUC__
-/* Use weak symbol linking to detect function availability at runtime */
-extern int ei_x_encode_atom_utf8(ei_x_buff *x, const char *p) __attribute__((weak));
-#define HAS_EI_X_ENCODE_ATOM_UTF8() (ei_x_encode_atom_utf8 != NULL)
-#else
-/* For non-GCC compilers, assume function is not available */
-#define HAS_EI_X_ENCODE_ATOM_UTF8() (0)
-#endif
+#include <dlfcn.h>
+
+/* Function pointer for ei_x_encode_atom_utf8 if available */
+static int (*ei_x_encode_atom_utf8_ptr)(ei_x_buff *x, const char *p) = NULL;
+static int ei_utf8_capability_checked = 0;
+
+/* Check if ei_x_encode_atom_utf8 is available at runtime */
+static int check_ei_utf8_capability(void) {
+    if (!ei_utf8_capability_checked) {
+        ei_x_encode_atom_utf8_ptr = dlsym(RTLD_DEFAULT, "ei_x_encode_atom_utf8");
+        ei_utf8_capability_checked = 1;
+        
+        if (ei_x_encode_atom_utf8_ptr) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                             "ei_x_encode_atom_utf8 function detected in ei library\n");
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                             "ei_x_encode_atom_utf8 function not available - using fallback\n");
+        }
+    }
+    return (ei_x_encode_atom_utf8_ptr != NULL);
+}
 
 /* Safe UTF-8 atom encoding with automatic fallback */
 static int ei_x_encode_atom_utf8_safe(ei_x_buff *x, const char *p) {
-#ifdef __GNUC__
-    if (HAS_EI_X_ENCODE_ATOM_UTF8()) {
-        return ei_x_encode_atom_utf8(x, p);
+    if (check_ei_utf8_capability()) {
+        return ei_x_encode_atom_utf8_ptr(x, p);
     } else {
         /* Fallback to regular atom encoding for older ei versions */
         return ei_x_encode_atom(x, p);
     }
-#else
-    /* Always use regular atom encoding for non-GCC builds */
-    return ei_x_encode_atom(x, p);
-#endif
 }
 
 /* Stolen from code added to ei in R12B-5.
@@ -423,7 +432,7 @@ static int detect_local_ei_capabilities(void) {
                      "Detecting local ei library capabilities\n");
     
     /* Check if UTF-8 atom encoding is available */
-    if (HAS_EI_X_ENCODE_ATOM_UTF8()) {
+    if (check_ei_utf8_capability()) {
         capabilities = OTP_VERSION_MODERN;
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
                          "UTF-8 atom encoding available - modern ei library detected\n");
